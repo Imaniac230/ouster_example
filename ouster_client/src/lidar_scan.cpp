@@ -11,6 +11,7 @@
 #include <cstring>
 #include <type_traits>
 #include <vector>
+#include <iostream>
 
 #include "logging.h"
 #include "ouster/impl/lidar_scan_impl.h"
@@ -462,8 +463,7 @@ ScanBatcher::ScanBatcher(size_t w, const sensor::packet_format& pf)
       next_valid_m_id(0),
       next_headers_m_id(0),
       next_valid_packet_id(0),
-      cache(pf.lidar_packet_size),
-      cache_packet_ts(0),
+      ls_write(w, h, pf.udp_profile_lidar),
       pf(pf) {
     if (pf.columns_per_packet == 0)
         throw std::invalid_argument("unexpected columns_per_packet: 0");
@@ -701,65 +701,69 @@ bool ScanBatcher::operator()(const ouster::sensor::LidarPacket& packet,
 
 bool ScanBatcher::operator()(const uint8_t* packet_buf, uint64_t packet_ts,
                              LidarScan& ls) {
+//    const auto new_stamp = std::chrono::system_clock::now();
+//    std::cout << "call delta: " << std::chrono::duration_cast<std::chrono::nanoseconds>(new_stamp - stamp).count() << " nanoseconds" << std::endl;
+//    stamp = new_stamp;
     if (ls.w != w || ls.h != h)
         throw std::invalid_argument("unexpected scan dimensions");
     if (ls.packet_timestamp().rows() != ls.w / pf.columns_per_packet)
         throw std::invalid_argument("unexpected scan columns_per_packet: " +
                                     std::to_string(pf.columns_per_packet));
 
-    // process cached packet and packet ts
-    if (cached_packet) {
-        cached_packet = false;
-        ls.frame_id = -1;
-        this->operator()(cache.data(), cache_packet_ts, ls);
-    }
-
-    const uint16_t f_id = pf.frame_id(packet_buf);
+    ++packets_accumulated;
+    bool swapped = false;
 
     const bool raw_headers = impl::raw_headers_enabled(pf, ls);
 
-    if (ls.frame_id == -1) {
-        // expecting to start batching a new scan
+    const uint16_t f_id = pf.frame_id(packet_buf);
+//    std::cout << "packet frame ID: " << f_id << ", current frame ID: " << ls_write.frame_id << std::endl;
+    if (ls_write.frame_id != f_id) {
+        // if not initializing with first packet
+        if (ls_write.frame_id != -1) {
+          // got a packet from a new frame
+          for (const auto& field_type : ls) {
+              auto end_m_id = next_valid_m_id;
+              if (raw_headers && field_type.first == ChanField::RAW_HEADERS) {
+                  end_m_id = next_headers_m_id;
+              }
+              if (field_type.first >= ChanField::CUSTOM0 &&
+                field_type.first <= ChanField::CUSTOM9)
+                continue;
+              impl::visit_field(ls, field_type.first, zero_field_cols(),
+                                field_type.first, end_m_id, w);
+          }
+          zero_header_cols(ls, next_valid_m_id, w);
+
+          // zero packet timestamp separately, since it's packet level data
+            ls.packet_timestamp()
+                .segment(next_valid_packet_id,
+                         ls.packet_timestamp().rows() - next_valid_packet_id)
+                .setZero();
+
+          // finish the scan and notify callback
+          std::swap(ls, ls_write);
+          swapped = true;
+          //FIXME(incomplete-cloud): even if the community driver impl is ported here 1-to-1,
+          // this condition still evaluates to true with less packets
+          // depends on the data bandwidth? - the smallest lidar profile accumulates more packets (but still not full)
+          // time deltas between the scanbatcher() calls are similar in both drive impls
+          // (always up to ~1 millisecond max)
+//          std::cout << "swapping scan, packets accumulated: " << packets_accumulated << std::endl;
+          packets_accumulated = 0;
+        }
+
+        // drop reordered packets from any previous frames
+        if (ls.frame_id > static_cast<uint16_t>(f_id)) return false;
+
+        // start new frame
         next_valid_m_id = 0;
         next_headers_m_id = 0;
         next_valid_packet_id = 0;
-        ls.frame_id = f_id;
+        ls_write.frame_id = f_id;
 
         const uint8_t f_thermal_shutdown = pf.thermal_shutdown(packet_buf);
         const uint8_t f_shot_limiting = pf.shot_limiting(packet_buf);
         ls.frame_status = frame_status(f_thermal_shutdown, f_shot_limiting);
-
-    } else if (ls.frame_id == static_cast<uint16_t>(f_id + 1)) {
-        // drop reordered packets from the previous frame
-        return false;
-    } else if (ls.frame_id != f_id) {
-        // got a packet from a new frame
-        for (const auto& field_type : ls) {
-            auto end_m_id = next_valid_m_id;
-            if (raw_headers && field_type.first == ChanField::RAW_HEADERS) {
-                end_m_id = next_headers_m_id;
-            }
-            if (field_type.first >= ChanField::CUSTOM0 &&
-                field_type.first <= ChanField::CUSTOM9)
-                continue;
-            impl::visit_field(ls, field_type.first, zero_field_cols(),
-                              field_type.first, end_m_id, w);
-        }
-
-        zero_header_cols(ls, next_valid_m_id, w);
-
-        // zero packet timestamp separately, since it's packet level data
-        ls.packet_timestamp()
-            .segment(next_valid_packet_id,
-                     ls.packet_timestamp().rows() - next_valid_packet_id)
-            .setZero();
-
-        // store packet buf and ts data to the cache for later processing
-        std::memcpy(cache.data(), packet_buf, cache.size());
-        cache_packet_ts = packet_ts;
-        cached_packet = true;
-
-        return true;
     }
 
     // handling packet level data: packet_timestamp
@@ -785,10 +789,19 @@ bool ScanBatcher::operator()(const uint8_t* packet_buf, uint64_t packet_ts,
         const uint32_t status = pf.col_status(col_buf);
         const bool valid = (status & 0x01);
 
+//        std::cout << "meas ID: " << m_id << std::endl;
+//        if (f_id == lastFrameID) {
+//            const uint16_t mIDDiff = m_id - lastMeasID;
+//            if (mIDDiff > 1) {
+//                std::cout << "missing " << (mIDDiff + 1) / 16 << " packets (last: " << lastMeasID << ", new: " << m_id << ")" << std::endl;
+//            }
+//        }
+
         if (!valid || m_id >= w) {
             happy_packet = false;
             break;
         }
+//        lastMeasID = m_id;
     }
 
     if (pf.block_parsable() && happy_packet && !raw_headers) {
@@ -797,7 +810,8 @@ bool ScanBatcher::operator()(const uint8_t* packet_buf, uint64_t packet_ts,
         _parse_by_col(packet_buf, ls);
     }
 
-    return false;
+//    lastFrameID = f_id;
+    return swapped;
 }
 
 }  // namespace ouster

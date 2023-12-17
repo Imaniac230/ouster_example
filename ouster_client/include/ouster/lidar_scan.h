@@ -491,9 +491,12 @@ class ScanBatcher {
     uint16_t next_valid_m_id;
     uint16_t next_headers_m_id;
     uint16_t next_valid_packet_id;
-    std::vector<uint8_t> cache;
-    uint64_t cache_packet_ts;
-    bool cached_packet = false;
+    LidarScan ls_write;
+
+    int packets_accumulated = 0;
+    std::chrono::time_point<std::chrono::system_clock> stamp = std::chrono::system_clock::now();
+    uint16_t lastMeasID = -1;
+    uint16_t lastFrameID = -1;
 
     void _parse_by_col(const uint8_t* packet_buf, LidarScan& ls);
     void _parse_by_block(const uint8_t* packet_buf, LidarScan& ls);
