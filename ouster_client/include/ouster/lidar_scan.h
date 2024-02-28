@@ -497,6 +497,20 @@ class ScanBatcher {
 
     void _parse_by_col(const uint8_t* packet_buf, LidarScan& ls);
     void _parse_by_block(const uint8_t* packet_buf, LidarScan& ls);
+    /**
+     * Checks if the given new frame ID is not older than the given current frame ID up to the given threshold.
+     * @param current_f_id Current frame ID being accumulated.
+     * @param new_f_id Frame ID from the new packet.
+     * @param threshold Maximum number of previous frames for checking (history threshold).
+     * @return Returns true if the new frame ID is within the threshold of previous frames, otherwise false.
+     */
+    inline static bool packet_from_previous_frames(const uint16_t current_f_id, const uint16_t new_f_id,
+                                                   const uint16_t threshold) {
+        for (uint16_t history = 1; history <= threshold; ++history) {
+            if (current_f_id == static_cast<uint16_t>(new_f_id + history)) return true;
+        }
+        return false;
+    }
 
    public:
     sensor::packet_format pf;  ///< The packet format object used for decoding
