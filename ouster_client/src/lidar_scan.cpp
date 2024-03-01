@@ -11,6 +11,7 @@
 #include <cstring>
 #include <type_traits>
 #include <vector>
+#include <iostream>
 
 #include "logging.h"
 #include "ouster/impl/lidar_scan_impl.h"
@@ -718,6 +719,12 @@ bool ScanBatcher::operator()(const uint8_t* packet_buf, uint64_t packet_ts,
 
     const bool raw_headers = impl::raw_headers_enabled(pf, ls);
 
+    if (ls.frame_id > static_cast<uint16_t>(f_id)) {
+        std::cout << "[" << std::chrono::high_resolution_clock::now().time_since_epoch().count()
+                  << "] got old packet f_id, current - new = " << ls.frame_id - f_id
+                  << " (current: " << ls.frame_id << ", new: " << f_id << ")" << std::endl;
+    }
+
     if (ls.frame_id == -1) {
         // expecting to start batching a new scan
         next_valid_m_id = 0;
@@ -730,6 +737,9 @@ bool ScanBatcher::operator()(const uint8_t* packet_buf, uint64_t packet_ts,
         ls.frame_status = frame_status(f_thermal_shutdown, f_shot_limiting);
 
     } else if (packet_from_previous_frames(static_cast<uint16_t>(ls.frame_id), f_id, 100)) {
+        std::cout << "[" << std::chrono::high_resolution_clock::now().time_since_epoch().count()
+                  << "] dropping old packet f_id, current - new = " << ls.frame_id - f_id
+                  << " (current: " << ls.frame_id << ", new: " << f_id << std::endl;
         return false;
     } else if (ls.frame_id != f_id) {
         // got a packet from a new frame
